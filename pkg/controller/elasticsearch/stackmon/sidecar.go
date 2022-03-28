@@ -5,8 +5,8 @@
 package stackmon
 
 import (
-	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -21,9 +21,8 @@ import (
 )
 
 const (
-	// cfgHashLabel is used to store a hash of the Metricbeat and Filebeat configurations.
-	// Using only one label for both configs to save labels.
-	cfgHashLabel = "elasticsearch.k8s.elastic.co/monitoring-config-hash"
+	// cfgHashAnnotation is an annotation to store a hash of the Metricbeat and Filebeat configurations to rotate the Pods when changed.
+	cfgHashAnnotation = "elasticsearch.k8s.elastic.co/monitoring-config-hash"
 )
 
 func Metricbeat(client k8s.Client, es esv1.Elasticsearch) (stackmon.BeatSidecar, error) {
@@ -56,12 +55,15 @@ func Filebeat(client k8s.Client, es esv1.Elasticsearch) (stackmon.BeatSidecar, e
 // WithMonitoring updates the Elasticsearch Pod template builder to deploy Metricbeat and Filebeat in sidecar containers
 // in the Elasticsearch pod and injects the volumes for the beat configurations and the ES CA certificates.
 func WithMonitoring(client k8s.Client, builder *defaults.PodTemplateBuilder, es esv1.Elasticsearch) (*defaults.PodTemplateBuilder, error) {
-	// no monitoring defined, skip
-	if !monitoring.IsDefined(&es) {
+	isMonitoringReconcilable, err := monitoring.IsReconcilable(&es)
+	if err != nil {
+		return nil, err
+	}
+	if !isMonitoringReconcilable {
 		return builder, nil
 	}
 
-	configHash := sha256.New224()
+	configHash := fnv.New32a()
 	volumes := make([]corev1.Volume, 0)
 
 	if monitoring.IsMetricsDefined(&es) {
@@ -94,8 +96,8 @@ func WithMonitoring(client k8s.Client, builder *defaults.PodTemplateBuilder, es 
 		configHash.Write(b.ConfigHash.Sum(nil))
 	}
 
-	// add the config hash label to ensure pod rotation when an ES password or a CA are rotated
-	builder.WithLabels(map[string]string{cfgHashLabel: fmt.Sprintf("%x", configHash.Sum(nil))})
+	// add the config hash annotation to ensure pod rotation when an ES password or a CA are rotated
+	builder.WithAnnotations(map[string]string{cfgHashAnnotation: fmt.Sprint(configHash.Sum32())})
 	// inject all volumes
 	builder.WithVolumes(volumes...)
 

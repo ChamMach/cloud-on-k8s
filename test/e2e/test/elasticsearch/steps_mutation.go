@@ -20,6 +20,7 @@ import (
 	esclient "github.com/elastic/cloud-on-k8s/pkg/controller/elasticsearch/client"
 	"github.com/elastic/cloud-on-k8s/pkg/utils/k8s"
 	"github.com/elastic/cloud-on-k8s/test/e2e/test"
+	"github.com/elastic/cloud-on-k8s/test/e2e/test/generation"
 )
 
 const (
@@ -71,19 +72,28 @@ func (b Builder) UpgradeTestSteps(k *test.K8sClient) test.StepList {
 
 func (b Builder) MutationTestSteps(k *test.K8sClient) test.StepList {
 	var clusterIDBeforeMutation string
+	var clusterGenerationBeforeMutation, clusterObservedGenerationBeforeMutation int64
 	var continuousHealthChecks *ContinuousHealthCheck
 	var dataIntegrityCheck *DataIntegrityCheck
-	mutatedFrom := b.MutatedFrom
+	mutatedFrom := b.MutatedFrom //nolint:ifshort
+	isMutated := true
 	if mutatedFrom == nil {
 		// cluster mutates to itself (same spec)
 		mutatedFrom = &b
+		isMutated = false
 	}
 
-	masterChangeBudgetWatcher := NewMasterChangeBudgetWatcher(b.Elasticsearch)
-	changeBudgetWatcher := NewChangeBudgetWatcher(mutatedFrom.Elasticsearch.Spec, b.Elasticsearch)
+	var watchers []test.Watcher
+	isNonHAUpgrade := IsNonHAUpgrade(b)
+	if !isNonHAUpgrade {
+		watchers = []test.Watcher{
+			NewChangeBudgetWatcher(mutatedFrom.Elasticsearch.Spec, b.Elasticsearch),
+			NewMasterChangeBudgetWatcher(b.Elasticsearch),
+		}
+	}
 
 	//nolint:thelper
-	return test.StepList{
+	steps := test.StepList{
 		test.Step{
 			Name: "Add some data to the cluster before starting the mutation",
 			Test: func(t *testing.T) {
@@ -94,10 +104,10 @@ func (b Builder) MutationTestSteps(k *test.K8sClient) test.StepList {
 		test.Step{
 			Name: "Start querying Elasticsearch cluster health while mutation is going on",
 			Skip: func() bool {
-				// Don't monitor cluster health if we're doing a rolling upgrade from a single data node cluster.
-				// The cluster will become either unavailable (single node) or red (multi-nodes) when
-				// that node goes down.
-				return IsRollingUpgradeFromOneDataNode(b)
+				// Don't monitor cluster health if we're doing a rolling upgrade from a single data node or non-HA cluster.
+				// The cluster will become either unavailable (1 or 2 node cluster due to loss of quorum) or red
+				// (single data node when that node goes down).
+				return isNonHAUpgrade
 			},
 			Test: func(t *testing.T) {
 				var err error
@@ -106,22 +116,26 @@ func (b Builder) MutationTestSteps(k *test.K8sClient) test.StepList {
 				continuousHealthChecks.Start()
 			},
 		},
-		masterChangeBudgetWatcher.StartStep(k),
-		changeBudgetWatcher.StartStep(k),
 		RetrieveClusterUUIDStep(b.Elasticsearch, k, &clusterIDBeforeMutation),
-	}.
-		WithSteps(AnnotatePodsWithBuilderHash(*mutatedFrom, k)).
+		generation.RetrieveGenerationsStep(&b.Elasticsearch, k, &clusterGenerationBeforeMutation, &clusterObservedGenerationBeforeMutation),
+	}
+
+	for _, watcher := range watchers {
+		steps = steps.WithStep(watcher.StartStep(k))
+	}
+
+	//nolint:thelper
+	steps = steps.WithSteps(AnnotatePodsWithBuilderHash(*mutatedFrom, k)).
 		WithSteps(b.UpgradeTestSteps(k)).
 		WithSteps(b.CheckK8sTestSteps(k)).
 		WithSteps(b.CheckStackTestSteps(k)).
 		WithSteps(test.StepList{
 			CompareClusterUUIDStep(b.Elasticsearch, k, &clusterIDBeforeMutation),
-			masterChangeBudgetWatcher.StopStep(k),
-			changeBudgetWatcher.StopStep(k),
+			generation.CompareObjectGenerationsStep(&b.Elasticsearch, k, isMutated, clusterGenerationBeforeMutation, clusterObservedGenerationBeforeMutation),
 			test.Step{
 				Name: "Elasticsearch cluster health should not have been red during mutation process",
 				Skip: func() bool {
-					return IsRollingUpgradeFromOneDataNode(b)
+					return IsNonHAUpgrade(b)
 				},
 				Test: func(t *testing.T) {
 					continuousHealthChecks.Stop()
@@ -141,13 +155,21 @@ func (b Builder) MutationTestSteps(k *test.K8sClient) test.StepList {
 				}),
 			},
 		})
+
+	for _, watcher := range watchers {
+		steps = steps.WithStep(watcher.StopStep(k))
+	}
+	return steps
 }
 
-func IsRollingUpgradeFromOneDataNode(b Builder) bool {
+func IsNonHAUpgrade(b Builder) bool {
 	if b.MutatedFrom == nil {
 		return false
 	}
-	if MustNumDataNodes(b.MutatedFrom.Elasticsearch) == 1 && b.TriggersRollingUpgrade() {
+	// a cluster of less than 3 nodes is by definition not HA will see some downtime during upgrades
+	// a cluster with just one data node will also see some index level unavailability
+	if (MustNumMasterNodes(b.MutatedFrom.Elasticsearch) < 3 || MustNumDataNodes(b.MutatedFrom.Elasticsearch) == 1) &&
+		b.TriggersRollingUpgrade() {
 		return true
 	}
 	return false

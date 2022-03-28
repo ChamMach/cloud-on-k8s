@@ -74,7 +74,7 @@ func TestElasticMapsServerTLSDisabled(t *testing.T) {
 
 func TestElasticMapsServerVersionUpgradeToLatest7x(t *testing.T) {
 	srcVersion := test.Ctx().ElasticStackVersion
-	dstVersion := test.LatestVersion7x
+	dstVersion := test.LatestReleasedVersion7x
 
 	test.SkipInvalidUpgrade(t, srcVersion, dstVersion)
 
@@ -94,5 +94,30 @@ func TestElasticMapsServerVersionUpgradeToLatest7x(t *testing.T) {
 	esWithLicense := test.LicenseTestBuilder()
 	esWithLicense.BuildingThis = es
 
-	test.RunMutations(t, []test.Builder{esWithLicense, ems}, []test.Builder{esWithLicense, emsUpgraded})
+	test.RunMutations(t, []test.Builder{esWithLicense, ems}, []test.Builder{emsUpgraded})
+}
+
+func TestElasticMapsServerVersionUpgradeToLatest8x(t *testing.T) {
+	srcVersion := test.Ctx().ElasticStackVersion
+	dstVersion := test.LatestReleasedVersion8x
+
+	test.SkipInvalidUpgrade(t, srcVersion, dstVersion)
+
+	name := "test-ems-version-upgrade-8x"
+	es := elasticsearch.NewBuilder(name).
+		WithESMasterDataNodes(3, elasticsearch.DefaultResources).
+		WithVersion(dstVersion) // we are not testing the Elasticsearch upgrade here
+
+	ems := maps.NewBuilder(name).
+		WithElasticsearchRef(es.Ref()).
+		WithNodeCount(2).
+		WithVersion(srcVersion).
+		WithRestrictedSecurityContext()
+
+	emsUpgraded := ems.WithVersion(dstVersion).WithMutatedFrom(&ems)
+
+	esWithLicense := test.LicenseTestBuilder()
+	esWithLicense.BuildingThis = es
+
+	test.RunMutations(t, []test.Builder{esWithLicense, ems}, []test.Builder{emsUpgraded})
 }

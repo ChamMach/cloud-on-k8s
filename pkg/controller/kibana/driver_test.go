@@ -277,7 +277,7 @@ func TestDriverDeploymentParams(t *testing.T) {
 								Namespace: "default",
 							},
 							Data: map[string][]byte{
-								certificates.CertFileName: nil,
+								certificates.CAFileName: nil,
 							},
 						},
 						&corev1.Secret{
@@ -312,7 +312,7 @@ func TestDriverDeploymentParams(t *testing.T) {
 			},
 			want: func() deployment.Params {
 				p := expectedDeploymentParams()
-				p.PodTemplateSpec.Labels["kibana.k8s.elastic.co/config-checksum"] = "c5496152d789682387b90ea9b94efcd82a2c6f572f40c016fb86c0d7"
+				p.PodTemplateSpec.Annotations["kibana.k8s.elastic.co/config-hash"] = "2368465874"
 				return p
 			}(),
 			wantErr: false,
@@ -428,13 +428,13 @@ func expectedDeploymentParams() deployment.Params {
 		PodTemplateSpec: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					"common.k8s.elastic.co/type":            "kibana",
-					"kibana.k8s.elastic.co/name":            "test",
-					"kibana.k8s.elastic.co/config-checksum": "c530a02188193a560326ce91e34fc62dcbd5722b45534a3f60957663",
-					"kibana.k8s.elastic.co/version":         "7.0.0",
+					"common.k8s.elastic.co/type":    "kibana",
+					"kibana.k8s.elastic.co/name":    "test",
+					"kibana.k8s.elastic.co/version": "7.0.0",
 				},
 				Annotations: map[string]string{
-					"co.elastic.logs/module": "kibana",
+					"co.elastic.logs/module":            "kibana",
+					"kibana.k8s.elastic.co/config-hash": "272660573",
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -642,7 +642,7 @@ func defaultInitialObjects() []runtime.Object {
 				Namespace: "default",
 			},
 			Data: map[string][]byte{
-				certificates.CertFileName: nil,
+				certificates.CAFileName: nil,
 			},
 		},
 		&corev1.Secret{
@@ -669,7 +669,7 @@ func defaultInitialObjects() []runtime.Object {
 				Namespace: "default",
 			},
 			Data: map[string][]byte{
-				"tls.crt": nil,
+				"ca.crt": nil,
 			},
 		},
 	}

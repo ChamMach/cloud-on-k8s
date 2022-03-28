@@ -31,7 +31,10 @@ func WriteAssocsToConfigHash(client k8s.Client, associations []commonv1.Associat
 }
 
 func writeAuthSecretToConfigHash(client k8s.Client, assoc commonv1.Association, configHash hash.Hash) error {
-	assocConf := assoc.AssociationConf()
+	assocConf, err := assoc.AssociationConf()
+	if err != nil {
+		return err
+	}
 	if !assocConf.AuthIsConfigured() {
 		return nil
 	}
@@ -57,8 +60,11 @@ func writeAuthSecretToConfigHash(client k8s.Client, assoc commonv1.Association, 
 }
 
 func writeCASecretToConfigHash(client k8s.Client, assoc commonv1.Association, configHash hash.Hash) error {
-	assocConf := assoc.AssociationConf()
-	if !assocConf.CAIsConfigured() {
+	assocConf, err := assoc.AssociationConf()
+	if err != nil {
+		return err
+	}
+	if !assocConf.GetCACertProvided() {
 		return nil
 	}
 
@@ -69,9 +75,9 @@ func writeCASecretToConfigHash(client k8s.Client, assoc commonv1.Association, co
 	if err := client.Get(context.Background(), publicCASecretNsName, &publicCASecret); err != nil {
 		return err
 	}
-	certPem, ok := publicCASecret.Data[certificates.CertFileName]
+	certPem, ok := publicCASecret.Data[certificates.CAFileName]
 	if !ok {
-		return errors.Errorf("public CA secret key %s doesn't exist", certificates.CertFileName)
+		return errors.Errorf("public CA secret key %s doesn't exist", certificates.CAFileName)
 	}
 
 	_, _ = configHash.Write(certPem)

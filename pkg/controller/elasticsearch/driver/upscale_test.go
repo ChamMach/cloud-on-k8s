@@ -6,6 +6,8 @@ package driver
 
 import (
 	"context"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
@@ -36,6 +38,66 @@ var onceDone = &sync.Once{}
 
 func init() {
 	onceDone.Do(func() {})
+}
+
+func Test_podsToCreate(t *testing.T) {
+	type args struct {
+		actualStatefulSets   sset.StatefulSetList
+		expectedStatefulSets sset.StatefulSetList
+	}
+	tests := []struct {
+		name string
+		args args
+		want []string
+	}{
+		{
+			name: "StatefulSet does not exist yet",
+			args: args{
+				actualStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts1"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(5)}},
+				},
+				expectedStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts1"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(8)}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts2"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(2)}},
+				},
+			},
+			want: []string{"sts1-5", "sts1-6", "sts1-7", "sts2-0", "sts2-1"},
+		},
+		{
+			name: "StatefulSet with no replica",
+			args: args{
+				actualStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts1"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(5)}},
+				},
+				expectedStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts1"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(0)}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts2"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(2)}},
+				},
+			},
+			want: []string{"sts2-0", "sts2-1"},
+		},
+		{
+			name: "StatefulSet removed",
+			args: args{
+				actualStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts1"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(5)}},
+				},
+				expectedStatefulSets: []appsv1.StatefulSet{
+					{ObjectMeta: metav1.ObjectMeta{Name: "sts2"}, Spec: appsv1.StatefulSetSpec{Replicas: pointer.Int32(2)}},
+				},
+			},
+			want: []string{"sts2-0", "sts2-1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := podsToCreate(tt.args.actualStatefulSets, tt.args.expectedStatefulSets)
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("podsToCreate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestHandleUpscaleAndSpecChanges(t *testing.T) {
@@ -262,41 +324,6 @@ func TestHandleUpscaleAndSpecChanges_PVCResize(t *testing.T) {
 	require.Len(t, es.Annotations, 2) // initial master nodes + sset to recreate
 }
 
-func Test_isReplicaIncrease(t *testing.T) {
-	tests := []struct {
-		name     string
-		actual   appsv1.StatefulSet
-		expected appsv1.StatefulSet
-		want     bool
-	}{
-		{
-			name:     "increase",
-			actual:   sset.TestSset{Replicas: 3}.Build(),
-			expected: sset.TestSset{Replicas: 5}.Build(),
-			want:     true,
-		},
-		{
-			name:     "decrease",
-			actual:   sset.TestSset{Replicas: 5}.Build(),
-			expected: sset.TestSset{Replicas: 3}.Build(),
-			want:     false,
-		},
-		{
-			name:     "same value",
-			actual:   sset.TestSset{Replicas: 3}.Build(),
-			expected: sset.TestSset{Replicas: 3}.Build(),
-			want:     false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isReplicaIncrease(tt.actual, tt.expected); got != tt.want {
-				t.Errorf("isReplicaIncrease() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func Test_adjustStatefulSetReplicas(t *testing.T) {
 	type args struct {
 		state              *upscaleState
@@ -417,9 +444,9 @@ func Test_adjustZenConfig(t *testing.T) {
 			es:          bootstrappedES,
 			statefulSet: sset.TestSset{Name: "masters", Version: "7.2.0", Replicas: 3, Master: true, Data: true},
 			pods: []runtime.Object{
-				newTestPod("masters-0").withVersion("6.8.0").isMaster(true).isData(true).toPodPtr(),
-				newTestPod("masters-1").withVersion("6.8.0").isMaster(true).isData(true).toPodPtr(),
-				newTestPod("masters-2").withVersion("6.8.0").isMaster(true).isData(true).toPodPtr(),
+				newTestPod("masters-0").withVersion("6.8.0").withRoles(esv1.MasterRole, esv1.DataRole).toPodPtr(),
+				newTestPod("masters-1").withVersion("6.8.0").withRoles(esv1.MasterRole, esv1.DataRole).toPodPtr(),
+				newTestPod("masters-2").withVersion("6.8.0").withRoles(esv1.MasterRole, esv1.DataRole).toPodPtr(),
 			},
 			wantMinimumMasterNodesSet: true,
 			wantInitialMasterNodesSet: false,

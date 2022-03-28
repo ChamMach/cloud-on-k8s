@@ -49,8 +49,8 @@ const (
 	DataMountHostPathTemplate = "/var/lib/%s/%s/agent-data"
 	DataMountPath             = "/usr/share/data"
 
-	// ConfigChecksumLabel is a label used to store Agent config checksum.
-	ConfigChecksumLabel = "agent.k8s.elastic.co/config-checksum"
+	// ConfigHashAnnotationName is an annotation used to store the Agent config hash.
+	ConfigHashAnnotationName = "agent.k8s.elastic.co/config-hash"
 
 	// VersionLabelName is a label used to track the version of a Agent Pod.
 	VersionLabelName = "agent.k8s.elastic.co/version"
@@ -76,6 +76,12 @@ const (
 	FleetServerElasticsearchUsername = "FLEET_SERVER_ELASTICSEARCH_USERNAME"
 	FleetServerElasticsearchPassword = "FLEET_SERVER_ELASTICSEARCH_PASSWORD" //nolint:gosec
 	FleetServerElasticsearchCA       = "FLEET_SERVER_ELASTICSEARCH_CA"
+	FleetServerServiceToken          = "FLEET_SERVER_SERVICE_TOKEN" //nolint:gosec
+
+	ubiSharedCAPath    = "/etc/pki/ca-trust/source/anchors/"
+	ubiUpdateCmd       = "/usr/bin/update-ca-trust"
+	debianSharedCAPath = "/usr/local/share/ca-certificates/"
+	debianUpdateCmd    = "/usr/sbin/update-ca-certificates"
 )
 
 var (
@@ -112,7 +118,7 @@ var (
 	}
 )
 
-func buildPodTemplate(params Params, fleetCerts *certificates.CertificatesSecret, configHash hash.Hash) (corev1.PodTemplateSpec, error) {
+func buildPodTemplate(params Params, fleetCerts *certificates.CertificatesSecret, configHash hash.Hash32) (corev1.PodTemplateSpec, error) {
 	defer tracing.Span(&params.Context)()
 	spec := &params.Agent.Spec
 	builder := defaults.NewPodTemplateBuilder(params.GetPodTemplate(), ContainerName)
@@ -147,14 +153,22 @@ func buildPodTemplate(params Params, fleetCerts *certificates.CertificatesSecret
 	}
 
 	// all volumes with CAs of direct associations
-	vols = append(vols, getVolumesFromAssociations(params.Agent.GetAssociations())...)
+	caAssocVols, err := getVolumesFromAssociations(params.Agent.GetAssociations())
+	if err != nil {
+		return corev1.PodTemplateSpec{}, err
+	}
+	vols = append(vols, caAssocVols...)
 
 	labels := maps.Merge(NewLabels(params.Agent), map[string]string{
-		ConfigChecksumLabel: fmt.Sprintf("%x", configHash.Sum(nil)),
-		VersionLabelName:    spec.Version})
+		VersionLabelName: spec.Version})
+
+	annotations := map[string]string{
+		ConfigHashAnnotationName: fmt.Sprint(configHash.Sum32()),
+	}
 
 	builder = builder.
 		WithLabels(labels).
+		WithAnnotations(annotations).
 		WithDockerImage(spec.Image, container.ImageRepository(container.AgentImage, spec.Version)).
 		WithAutomountServiceAccountToken().
 		WithVolumeLikes(vols...).
@@ -304,8 +318,12 @@ func applyRelatedEsAssoc(agent agentv1alpha1.Agent, esAssociation commonv1.Assoc
 		)
 	}
 
+	assocConf, err := esAssociation.AssociationConf()
+	if err != nil {
+		return nil, err
+	}
 	builder = builder.WithVolumeLikes(volume.NewSecretVolumeWithMountPath(
-		esAssociation.AssociationConf().GetCASecretName(),
+		assocConf.GetCASecretName(),
 		fmt.Sprintf("%s-certs", esAssociation.AssociationType()),
 		certificatesDir(esAssociation),
 	))
@@ -336,21 +354,25 @@ func writeEsAssocToConfigHash(params Params, esAssociation commonv1.Association,
 	)
 }
 
-func getVolumesFromAssociations(associations []commonv1.Association) []volume.VolumeLike {
+func getVolumesFromAssociations(associations []commonv1.Association) ([]volume.VolumeLike, error) {
 	var vols []volume.VolumeLike //nolint:prealloc
 	for i, assoc := range associations {
-		if !assoc.AssociationConf().CAIsConfigured() {
+		assocConf, err := assoc.AssociationConf()
+		if err != nil {
+			return nil, err
+		}
+		if !assocConf.CAIsConfigured() {
 			// skip as there is no volume to mount if association has no CA configured
 			continue
 		}
-		caSecretName := assoc.AssociationConf().GetCASecretName()
+		caSecretName := assocConf.GetCASecretName()
 		vols = append(vols, volume.NewSecretVolumeWithMountPath(
 			caSecretName,
 			fmt.Sprintf("%s-certs-%d", assoc.AssociationType(), i),
 			certificatesDir(assoc),
 		))
 	}
-	return vols
+	return vols, nil
 }
 
 func getAssociatedFleetServer(params Params) (commonv1.Associated, error) {
@@ -364,13 +386,8 @@ func getAssociatedFleetServer(params Params) (commonv1.Associated, error) {
 
 	fsRef := assoc.AssociationRef()
 	fs := agentv1alpha1.Agent{}
-
-	if err := association.FetchWithAssociations(
-		params.Context,
-		params.Client,
-		reconcile.Request{NamespacedName: fsRef.NamespacedName()},
-		&fs,
-	); err != nil {
+	request := reconcile.Request{NamespacedName: fsRef.NamespacedName()}
+	if err = params.Client.Get(params.Context, request.NamespacedName, &fs); err != nil {
 		return nil, err
 	}
 
@@ -381,11 +398,16 @@ func trustCAScript(caPath string) string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 set -e
 if [[ -f %[1]s ]]; then
-  cp %[1]s /etc/pki/ca-trust/source/anchors/
-  update-ca-trust
+  if [[ -f %[3]s ]]; then
+    cp %[1]s %[2]s
+    %[3]s
+  elif [[ -f %[5]s ]]; then
+    cp %[1]s %[4]s
+    %[5]s
+  fi
 fi
 /usr/bin/tini -- /usr/local/bin/docker-entrypoint -e
-`, caPath)
+`, caPath, ubiSharedCAPath, ubiUpdateCmd, debianSharedCAPath, debianUpdateCmd)
 }
 
 func createDataVolume(params Params) volume.VolumeLike {
@@ -436,8 +458,8 @@ func getFleetSetupKibanaEnvVars(agent agentv1alpha1.Agent, client k8s.Client) (m
 
 		envVars := map[string]string{
 			KibanaFleetHost:     kbConnectionSettings.host,
-			KibanaFleetUsername: kbConnectionSettings.username,
-			KibanaFleetPassword: kbConnectionSettings.password,
+			KibanaFleetUsername: kbConnectionSettings.credentials.Username,
+			KibanaFleetPassword: kbConnectionSettings.credentials.Password,
 			KibanaFleetSetup:    strconv.FormatBool(agent.Spec.KibanaRef.IsDefined()),
 		}
 
@@ -461,7 +483,7 @@ func getFleetSetupFleetEnvVars(agent agentv1alpha1.Agent, client k8s.Client) (ma
 
 	// Agent in Fleet mode can run as a Fleet Server or as an Elastic Agent that connects to Fleet Server.
 	// Both cases are handled below and the presence of FleetServerRef indicates the latter case.
-	if agent.Spec.FleetServerEnabled {
+	if agent.Spec.FleetServerEnabled { //nolint:nestif
 		fleetURL, err := association.ServiceURL(
 			client,
 			types.NamespacedName{Namespace: agent.Namespace, Name: HTTPServiceName(agent.Name)},
@@ -471,19 +493,26 @@ func getFleetSetupFleetEnvVars(agent agentv1alpha1.Agent, client k8s.Client) (ma
 			return nil, err
 		}
 
-		fleetCfg[FleetCA] = path.Join(FleetCertsMountPath, certificates.CAFileName)
 		fleetCfg[FleetURL] = fleetURL
+		fleetCfg[FleetCA] = path.Join(FleetCertsMountPath, certificates.CAFileName)
 	} else if agent.Spec.FleetServerRef.IsDefined() {
 		assoc, err := association.SingleAssociationOfType(agent.GetAssociations(), commonv1.FleetServerAssociationType)
 		if err != nil {
 			return nil, err
 		}
-
-		if assoc != nil {
+		if assoc == nil {
+			return fleetCfg, nil
+		}
+		assocConf, err := assoc.AssociationConf()
+		if err != nil {
+			return nil, err
+		}
+		fleetCfg[FleetURL] = assocConf.GetURL()
+		if assocConf.GetCACertProvided() {
 			fleetCfg[FleetCA] = path.Join(certificatesDir(assoc), CAFileName)
-			fleetCfg[FleetURL] = assoc.AssociationConf().GetURL()
 		}
 	}
+
 	return fleetCfg, nil
 }
 
@@ -506,8 +535,13 @@ func getFleetSetupFleetServerEnvVars(agent agentv1alpha1.Agent, client k8s.Clien
 		}
 
 		fleetServerCfg[FleetServerElasticsearchHost] = esConnectionSettings.host
-		fleetServerCfg[FleetServerElasticsearchUsername] = esConnectionSettings.username
-		fleetServerCfg[FleetServerElasticsearchPassword] = esConnectionSettings.password
+
+		if esConnectionSettings.credentials.HasServiceAccountToken() {
+			fleetServerCfg[FleetServerServiceToken] = esConnectionSettings.credentials.ServiceAccountToken
+		} else {
+			fleetServerCfg[FleetServerElasticsearchUsername] = esConnectionSettings.credentials.Username
+			fleetServerCfg[FleetServerElasticsearchPassword] = esConnectionSettings.credentials.Password
+		}
 
 		// don't set ca key if ca is not available
 		if esConnectionSettings.ca != "" {

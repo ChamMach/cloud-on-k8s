@@ -12,6 +12,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,8 +23,11 @@ import (
 	"go.elastic.co/apm"
 	"go.uber.org/automaxprocs/maxprocs"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp" // allow gcp authentication
@@ -35,6 +39,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/elastic/cloud-on-k8s/pkg/about"
 	agentv1alpha1 "github.com/elastic/cloud-on-k8s/pkg/apis/agent/v1alpha1"
@@ -62,6 +67,7 @@ import (
 	controllerscheme "github.com/elastic/cloud-on-k8s/pkg/controller/common/scheme"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common/tracing"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common/version"
+	commonwebhook "github.com/elastic/cloud-on-k8s/pkg/controller/common/webhook"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/elasticsearch"
 	esclient "github.com/elastic/cloud-on-k8s/pkg/controller/elasticsearch/client"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/elasticsearch/settings"
@@ -284,10 +290,10 @@ func Command() *cobra.Command {
 		DefaultWebhookName,
 		"Name of the Kubernetes ValidatingWebhookConfiguration resource. Only used when enable-webhook is true.",
 	)
-	cmd.Flags().Bool(
+	cmd.Flags().String(
 		operator.SetDefaultSecurityContextFlag,
-		true,
-		"Enables setting the default security context with fsGroup=1000 for Elasticsearch 8.0+ Pods. Ignored pre-8.0.",
+		"auto-detect",
+		"Enables setting the default security context with fsGroup=1000 for Elasticsearch 8.0+ Pods. Ignored pre-8.0. Possible values: true, false, auto-detect",
 	)
 
 	// hide development mode flags from the usage message
@@ -478,11 +484,6 @@ func startOperator(ctx context.Context) error {
 		// The managed cache should always include the operator namespace so that we can work with operator-internal resources.
 		managedNamespaces = append(managedNamespaces, operatorNamespace)
 
-		// Add the empty namespace to allow watching cluster-scoped resources if storage class validation is enabled.
-		if viper.GetBool(operator.ValidateStorageClassFlag) {
-			managedNamespaces = append(managedNamespaces, "")
-		}
-
 		opts.NewCache = cache.MultiNamespacedCacheBuilder(managedNamespaces)
 	}
 
@@ -549,6 +550,12 @@ func startOperator(ctx context.Context) error {
 		return err
 	}
 
+	setDefaultSecurityContext, err := determineSetDefaultSecurityContext(viper.GetString(operator.SetDefaultSecurityContextFlag), clientset)
+	if err != nil {
+		log.Error(err, "failed to determine how to set default security context")
+		return err
+	}
+
 	params := operator.Parameters{
 		Dialer:            dialer,
 		ExposedNodeLabels: exposedNodeLabels,
@@ -564,13 +571,13 @@ func startOperator(ctx context.Context) error {
 			RotateBefore: certRotateBefore,
 		},
 		MaxConcurrentReconciles:   viper.GetInt(operator.MaxConcurrentReconcilesFlag),
-		SetDefaultSecurityContext: viper.GetBool(operator.SetDefaultSecurityContextFlag),
+		SetDefaultSecurityContext: setDefaultSecurityContext,
 		ValidateStorageClass:      viper.GetBool(operator.ValidateStorageClassFlag),
 		Tracer:                    tracer,
 	}
 
 	if viper.GetBool(operator.EnableWebhookFlag) {
-		setupWebhook(mgr, params.CertRotation, params.ValidateStorageClass, clientset, exposedNodeLabels)
+		setupWebhook(mgr, params.CertRotation, params.ValidateStorageClass, clientset, exposedNodeLabels, managedNamespaces)
 	}
 
 	enforceRbacOnRefs := viper.GetBool(operator.EnforceRBACOnRefsFlag)
@@ -681,6 +688,54 @@ func chooseAndValidateIPFamily(ipFamilyStr string, ipFamilyDefault corev1.IPFami
 	}
 }
 
+// determineSetDefaultSecurityContext determines what settings we need to use for security context by using the following rules:
+// 1. If the setDefaultSecurityContext is explicitly set to either true, or false, use this value.
+// 2. use OpenShift detection to determine whether or not we are running within an OpenShift cluster.
+//    If we determine we are on an OpenShift cluster, and since OpenShift automatically sets security context, return false,
+//    otherwise, return true as we'll need to set this security context on non-OpenShift clusters.
+func determineSetDefaultSecurityContext(setDefaultSecurityContext string, clientset kubernetes.Interface) (bool, error) {
+	if setDefaultSecurityContext == "auto-detect" {
+		openshift, err := isOpenShift(clientset)
+		return !openshift, err
+	}
+	return strconv.ParseBool(setDefaultSecurityContext)
+}
+
+// isOpenShift detects whether we are running on OpenShift.  Detection inspired by kubevirt
+//    https://github.com/kubevirt/kubevirt/blob/f71e9c9615a6c36178169d66814586a93ba515b5/pkg/util/cluster/cluster.go#L21
+func isOpenShift(clientset kubernetes.Interface) (bool, error) {
+	openshiftSecurityGroupVersion := schema.GroupVersion{Group: "security.openshift.io", Version: "v1"}
+	apiResourceList, err := clientset.Discovery().ServerResourcesForGroupVersion(openshiftSecurityGroupVersion.String())
+	if err != nil {
+		// In case of an error, check if security.openshift.io is the reason (unlikely).
+		var e *discovery.ErrGroupDiscoveryFailed
+		if ok := errors.As(err, &e); ok {
+			if _, exists := e.Groups[openshiftSecurityGroupVersion]; exists {
+				// If security.openshift.io is the reason for the error, we are absolutely on OpenShift
+				return true, nil
+			}
+		}
+		// If the security.openshift.io group isn't found, we are not on OpenShift
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// Search for "securitycontextconstraints" within the cluster's API resources,
+	// since this is an OpenShift specific API resource that does not exist outside of OpenShift.
+	for _, apiResource := range apiResourceList.APIResources {
+		if apiResource.Name == "securitycontextconstraints" {
+			// we have determined we are absolutely running on OpenShift
+			return true, nil
+		}
+	}
+
+	// We could not determine that we are running on an OpenShift cluster,
+	// so we will behave as if "setDefaultSecurityContext" was set to true.
+	return false, nil
+}
+
 func registerControllers(mgr manager.Manager, params operator.Parameters, accessReviewer rbac.AccessReviewer) error {
 	controllers := []struct {
 		name         string
@@ -787,7 +842,8 @@ func setupWebhook(
 	certRotation certificates.RotationParams,
 	validateStorageClass bool,
 	clientset kubernetes.Interface,
-	exposedNodeLabels esvalidation.NodeLabels) {
+	exposedNodeLabels esvalidation.NodeLabels,
+	managedNamespaces []string) {
 	manageWebhookCerts := viper.GetBool(operator.ManageWebhookCertsFlag)
 	if manageWebhookCerts {
 		log.Info("Automatic management of the webhook certificates enabled")
@@ -821,7 +877,8 @@ func setupWebhook(
 	// setup webhooks for supported types
 	webhookObjects := []interface {
 		runtime.Object
-		SetupWebhookWithManager(manager.Manager) error
+		admission.Validator
+		WebhookPath() string
 	}{
 		&agentv1alpha1.Agent{},
 		&apmv1.ApmServer{},
@@ -835,14 +892,19 @@ func setupWebhook(
 		&emsv1alpha1.ElasticMapsServer{},
 	}
 	for _, obj := range webhookObjects {
-		if err := obj.SetupWebhookWithManager(mgr); err != nil {
+		if err := commonwebhook.SetupValidatingWebhookWithConfig(&commonwebhook.Config{
+			Manager:          mgr,
+			WebhookPath:      obj.WebhookPath(),
+			ManagedNamespace: managedNamespaces,
+			Validator:        obj,
+		}); err != nil {
 			gvk := obj.GetObjectKind().GroupVersionKind()
 			log.Error(err, "Failed to setup webhook", "group", gvk.Group, "version", gvk.Version, "kind", gvk.Kind)
 		}
 	}
 
 	// esv1 validating webhook is wired up differently, in order to access the k8s client
-	esvalidation.RegisterWebhook(mgr, validateStorageClass, exposedNodeLabels)
+	esvalidation.RegisterWebhook(mgr, validateStorageClass, exposedNodeLabels, managedNamespaces)
 
 	// wait for the secret to be populated in the local filesystem before returning
 	interval := time.Second * 1

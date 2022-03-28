@@ -6,8 +6,8 @@ package kibana
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 
 	pkgerrors "github.com/pkg/errors"
 	"go.elastic.co/apm"
@@ -98,10 +98,18 @@ func (d *driver) Reconcile(
 	params operator.Parameters,
 ) *reconciler.Results {
 	results := reconciler.NewResult(ctx)
-	if !association.IsConfiguredIfSet(kb.EsAssociation(), d.recorder) {
+	isEsAssocConfigured, err := association.IsConfiguredIfSet(kb.EsAssociation(), d.recorder)
+	if err != nil {
+		return results.WithError(err)
+	}
+	if !isEsAssocConfigured {
 		return results
 	}
-	if !association.IsConfiguredIfSet(kb.EntAssociation(), d.recorder) {
+	isEntAssocConfigured, err := association.IsConfiguredIfSet(kb.EntAssociation(), d.recorder)
+	if err != nil {
+		return results.WithError(err)
+	}
+	if !isEntAssocConfigured {
 		return results
 	}
 
@@ -130,7 +138,11 @@ func (d *driver) Reconcile(
 	}
 
 	logger := log.WithValues("namespace", kb.Namespace, "kb_name", kb.Name)
-	if !association.AllowVersion(d.version, kb, logger, d.Recorder()) {
+	assocAllowed, err := association.AllowVersion(d.version, kb, logger, d.Recorder())
+	if err != nil {
+		return results.WithError(err)
+	}
+	if !assocAllowed {
 		return results // will eventually retry
 	}
 
@@ -205,7 +217,7 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 		return deployment.Params{}, err
 	}
 	// setup a keystore with secure settings in an init container, if specified by the user
-	keystoreResources, err := keystore.NewResources(
+	keystoreResources, err := keystore.ReconcileResources(
 		d,
 		kb,
 		kbv1.KBNamer,
@@ -216,7 +228,11 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 		return deployment.Params{}, err
 	}
 
-	kibanaPodSpec, err := NewPodTemplateSpec(d.client, *kb, keystoreResources, d.buildVolumes(kb))
+	volumes, err := d.buildVolumes(kb)
+	if err != nil {
+		return deployment.Params{}, err
+	}
+	kibanaPodSpec, err := NewPodTemplateSpec(d.client, *kb, keystoreResources, volumes)
 	if err != nil {
 		return deployment.Params{}, err
 	}
@@ -224,13 +240,13 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 	// Build a checksum of the configuration, which we can use to cause the Deployment to roll Kibana
 	// instances in case of any change in the CA file, secure settings or credentials contents.
 	// This is done because Kibana does not support updating those without restarting the process.
-	configChecksum := sha256.New224()
+	configHash := fnv.New32a()
 	if keystoreResources != nil {
-		_, _ = configChecksum.Write([]byte(keystoreResources.Version))
+		_, _ = configHash.Write([]byte(keystoreResources.Version))
 	}
 
 	// we need to deref the secret here to include it in the checksum otherwise Kibana will not be rolled on contents changes
-	if err := commonassociation.WriteAssocsToConfigHash(d.client, kb.GetAssociations(), configChecksum); err != nil {
+	if err := commonassociation.WriteAssocsToConfigHash(d.client, kb.GetAssociations(), configHash); err != nil {
 		return deployment.Params{}, err
 	}
 
@@ -245,7 +261,7 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 			return deployment.Params{}, err
 		}
 		if httpCert, ok := httpCerts.Data[certificates.CertFileName]; ok {
-			_, _ = configChecksum.Write(httpCert)
+			_, _ = configHash.Write(httpCert)
 		}
 	}
 
@@ -255,11 +271,11 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 	if err != nil {
 		return deployment.Params{}, err
 	}
-	_, _ = configChecksum.Write(configSecret.Data[SettingsFilename])
+	_, _ = configHash.Write(configSecret.Data[SettingsFilename])
 
-	// add the checksum to a label for the deployment and its pods (the important bit is that the pod template
+	// add the checksum to an annotation for the deployment and its pods (the important bit is that the pod template
 	// changes, which will trigger a rolling update)
-	kibanaPodSpec.Labels[configChecksumLabel] = fmt.Sprintf("%x", configChecksum.Sum(nil))
+	kibanaPodSpec.Annotations[configHashAnnotationName] = fmt.Sprint(configHash.Sum32())
 
 	// decide the strategy type
 	strategyType, err := d.getStrategyType(kb)
@@ -278,16 +294,24 @@ func (d *driver) deploymentParams(kb *kbv1.Kibana) (deployment.Params, error) {
 	}, nil
 }
 
-func (d *driver) buildVolumes(kb *kbv1.Kibana) []commonvolume.VolumeLike {
+func (d *driver) buildVolumes(kb *kbv1.Kibana) ([]commonvolume.VolumeLike, error) {
 	volumes := []commonvolume.VolumeLike{DataVolume, ConfigSharedVolume, ConfigVolume(*kb)}
 
-	if kb.EsAssociation().AssociationConf().CAIsConfigured() {
-		esCertsVolume := esCaCertSecretVolume(*kb)
+	esAssocConf, err := kb.EsAssociation().AssociationConf()
+	if err != nil {
+		return nil, err
+	}
+	if esAssocConf.CAIsConfigured() {
+		esCertsVolume := esCaCertSecretVolume(*esAssocConf)
 		volumes = append(volumes, esCertsVolume)
 	}
 
-	if kb.EntAssociation().AssociationConf().CAIsConfigured() {
-		entCertsVolume := entCaCertSecretVolume(*kb)
+	entAssocConf, err := kb.EntAssociation().AssociationConf()
+	if err != nil {
+		return nil, err
+	}
+	if entAssocConf.CAIsConfigured() {
+		entCertsVolume := entCaCertSecretVolume(*entAssocConf)
 		volumes = append(volumes, entCertsVolume)
 	}
 
@@ -295,7 +319,7 @@ func (d *driver) buildVolumes(kb *kbv1.Kibana) []commonvolume.VolumeLike {
 		httpCertsVolume := certificates.HTTPCertSecretVolume(kbv1.KBNamer, kb.Name)
 		volumes = append(volumes, httpCertsVolume)
 	}
-	return volumes
+	return volumes, nil
 }
 
 func NewService(kb kbv1.Kibana) *corev1.Service {

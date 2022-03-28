@@ -6,8 +6,8 @@ package enterprisesearch
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"sync/atomic"
 
@@ -26,6 +26,7 @@ import (
 	entv1 "github.com/elastic/cloud-on-k8s/pkg/apis/enterprisesearch/v1"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/association"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common"
+	commonassociation "github.com/elastic/cloud-on-k8s/pkg/controller/common/association"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common/certificates"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common/defaults"
 	"github.com/elastic/cloud-on-k8s/pkg/controller/common/driver"
@@ -147,7 +148,7 @@ func (r *ReconcileEnterpriseSearch) Reconcile(ctx context.Context, request recon
 	defer tracing.EndTransaction(tx)
 
 	var ent entv1.EnterpriseSearch
-	if err := association.FetchWithAssociations(ctx, r.Client, request, &ent); err != nil {
+	if err := r.Client.Get(ctx, request.NamespacedName, &ent); err != nil {
 		if apierrors.IsNotFound(err) {
 			return reconcile.Result{}, r.onDelete(types.NamespacedName{
 				Namespace: request.Namespace,
@@ -162,7 +163,11 @@ func (r *ReconcileEnterpriseSearch) Reconcile(ctx context.Context, request recon
 		return reconcile.Result{}, nil
 	}
 
-	if !association.IsConfiguredIfSet(&ent, r.recorder) {
+	isEsAssocConfigured, err := association.IsConfiguredIfSet(&ent, r.recorder)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !isEsAssocConfigured {
 		return reconcile.Result{}, nil
 	}
 
@@ -211,7 +216,11 @@ func (r *ReconcileEnterpriseSearch) doReconcile(ctx context.Context, ent entv1.E
 		return reconcile.Result{}, err
 	}
 	logger := log.WithValues("namespace", ent.Namespace, "ent_name", ent.Name)
-	if !association.AllowVersion(entVersion, ent.Associated(), logger, r.recorder) {
+	assocAllowed, err := association.AllowVersion(entVersion, ent.Associated(), logger, r.recorder)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !assocAllowed {
 		return reconcile.Result{}, nil // will eventually retry once updated
 	}
 
@@ -312,7 +321,7 @@ func NewService(ent entv1.EnterpriseSearch) *corev1.Service {
 
 func buildConfigHash(c k8s.Client, ent entv1.EnterpriseSearch, configSecret corev1.Secret) (string, error) {
 	// build a hash of various settings to rotate the Pod on any change
-	configHash := sha256.New224()
+	configHash := fnv.New32a()
 
 	// - in the Enterprise Search configuration file content
 	_, _ = configHash.Write(configSecret.Data[ConfigFilename])
@@ -331,17 +340,10 @@ func buildConfigHash(c k8s.Client, ent entv1.EnterpriseSearch, configSecret core
 		}
 	}
 
-	// - in the Elasticsearch TLS certificates
-	if ent.AssociationConf().CAIsConfigured() {
-		var esPublicCASecret corev1.Secret
-		key := types.NamespacedName{Namespace: ent.Namespace, Name: ent.AssociationConf().GetCASecretName()}
-		if err := c.Get(context.Background(), key, &esPublicCASecret); err != nil {
-			return "", err
-		}
-		if certPem, ok := esPublicCASecret.Data[certificates.CertFileName]; ok {
-			_, _ = configHash.Write(certPem)
-		}
+	// - in the associated Elasticsearch TLS certificates
+	if err := commonassociation.WriteAssocsToConfigHash(c, ent.GetAssociations(), configHash); err != nil {
+		return "", err
 	}
 
-	return fmt.Sprintf("%x", configHash.Sum(nil)), nil
+	return fmt.Sprint(configHash.Sum32()), nil
 }

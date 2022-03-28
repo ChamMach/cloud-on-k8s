@@ -6,9 +6,9 @@ package stackmon
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"hash"
+	"hash/fnv"
 	"path/filepath"
 	"text/template"
 
@@ -77,7 +77,7 @@ func newBeatConfig(client k8s.Client, beatName string, resource monitoring.HasMo
 		return beatConfig{}, err
 	}
 
-	configHash := sha256.New224()
+	configHash := fnv.New32a()
 	configHash.Write(configBytes)
 
 	configSecret := corev1.Secret{
@@ -100,15 +100,19 @@ func newBeatConfig(client k8s.Client, beatName string, resource monitoring.HasMo
 }
 
 func buildOutputConfig(client k8s.Client, assoc commonv1.Association) (map[string]interface{}, volume.VolumeLike, error) {
-	username, password, err := association.ElasticsearchAuthSettings(client, assoc)
+	credentials, err := association.ElasticsearchAuthSettings(client, assoc)
 	if err != nil {
 		return nil, volume.SecretVolume{}, err
 	}
 
+	assocConf, err := assoc.AssociationConf()
+	if err != nil {
+		return nil, nil, err
+	}
 	outputConfig := map[string]interface{}{
-		"username": username,
-		"password": password,
-		"hosts":    []string{assoc.AssociationConf().GetURL()},
+		"username": credentials.Username,
+		"password": credentials.Password,
+		"hosts":    []string{assocConf.GetURL()},
 	}
 
 	caDirPath := fmt.Sprintf(
@@ -117,12 +121,12 @@ func buildOutputConfig(client k8s.Client, assoc commonv1.Association) (map[strin
 	)
 
 	var caVolume volume.VolumeLike
-	if assoc.AssociationConf().GetCACertProvided() {
+	if assocConf.GetCACertProvided() {
 		sslCAPath := filepath.Join(caDirPath, certificates.CAFileName)
 		outputConfig["ssl.certificate_authorities"] = []string{sslCAPath}
 		volumeName := caVolumeName(assoc)
 		caVolume = volume.NewSecretVolumeWithMountPath(
-			assoc.AssociationConf().GetCASecretName(), volumeName, caDirPath,
+			assocConf.GetCASecretName(), volumeName, caDirPath,
 		)
 	}
 
@@ -160,8 +164,8 @@ type inputConfigData struct {
 	Username string
 	Password string
 	IsSSL    bool
-	SSLPath  string
-	SSLMode  string
+	HasCA    bool
+	CAPath   string
 }
 
 // buildMetricbeatBaseConfig builds the base configuration for Metricbeat with the Elasticsearch or Kibana modules used
@@ -181,23 +185,32 @@ func buildMetricbeatBaseConfig(
 		return "", nil, err
 	}
 
+	hasCA := false
+	if isTLS {
+		var err error
+		hasCA, err = certificates.PublicCertsHasCACert(client, namer, nsn.Namespace, nsn.Name)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
 	configData := inputConfigData{
-		URL:      url,
 		Username: user.MonitoringUserName,
 		Password: password,
-		IsSSL:    isTLS,
+		URL:      url,   // Metricbeat in the sidecar connects to the monitored resource using `localhost`
+		IsSSL:    isTLS, // enable SSL configuration based on whether the monitored resource has TLS enabled
+		HasCA:    hasCA, // the CA is optional to support custom certificate issued by a well-known CA, so without provided CA to configure
 	}
 
 	var caVolume volume.VolumeLike
-	if configData.IsSSL {
+	if configData.HasCA {
 		caVolume = volume.NewSecretVolumeWithMountPath(
 			certificates.PublicCertsSecretName(namer, nsn.Name),
 			fmt.Sprintf("%s-local-ca", string(associationType)),
 			fmt.Sprintf("/mnt/elastic-internal/%s/%s/%s/certs", string(associationType), nsn.Namespace, nsn.Name),
 		)
 
-		configData.SSLPath = filepath.Join(caVolume.VolumeMount().MountPath, certificates.CAFileName)
-		configData.SSLMode = "certificate"
+		configData.CAPath = filepath.Join(caVolume.VolumeMount().MountPath, certificates.CAFileName)
 	}
 
 	// render the config template with the config data

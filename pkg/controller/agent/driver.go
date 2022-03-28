@@ -6,8 +6,8 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -78,7 +78,11 @@ func internalReconcile(params Params) *reconciler.Results {
 	if err != nil {
 		return results.WithError(err)
 	}
-	if !association.AllowVersion(agentVersion, &params.Agent, params.Logger(), params.EventRecorder) {
+	assocAllowed, err := association.AllowVersion(agentVersion, &params.Agent, params.Logger(), params.EventRecorder)
+	if err != nil {
+		return results.WithError(err)
+	}
+	if !assocAllowed {
 		return results // will eventually retry
 	}
 
@@ -87,7 +91,7 @@ func internalReconcile(params Params) *reconciler.Results {
 		return results.WithError(err)
 	}
 
-	configHash := sha256.New224()
+	configHash := fnv.New32a()
 	var fleetCerts *certificates.CertificatesSecret
 	if params.Agent.Spec.FleetServerEnabled {
 		var caResults *reconciler.Results
